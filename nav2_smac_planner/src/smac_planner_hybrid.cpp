@@ -183,6 +183,7 @@ void SmacPlannerHybrid::configure(
 
   // Initialize collision checker
   _collision_checker = GridCollisionChecker(_costmap, _angle_quantizations);
+  _footprint_spec = _costmap_ros->getRobotFootprint();
   _collision_checker.setFootprint(
     _costmap_ros->getRobotFootprint(),
     _costmap_ros->getUseRadius(),
@@ -215,6 +216,7 @@ void SmacPlannerHybrid::configure(
   }
 
   _raw_plan_publisher = node->create_publisher<nav_msgs::msg::Path>("unsmoothed_plan", 1);
+  _footprint_list_publisher = node->create_publisher<visualization_msgs::msg::MarkerArray>("/footprint_list", 1);
 
   RCLCPP_INFO(
     _logger, "Configured plugin %s of type SmacPlannerHybrid with "
@@ -231,6 +233,7 @@ void SmacPlannerHybrid::activate()
     _logger, "Activating plugin %s of type SmacPlannerHybrid",
     _name.c_str());
   _raw_plan_publisher->on_activate();
+  _footprint_list_publisher->on_activate();
   if (_costmap_downsampler) {
     _costmap_downsampler->on_activate();
   }
@@ -246,6 +249,7 @@ void SmacPlannerHybrid::deactivate()
     _logger, "Deactivating plugin %s of type SmacPlannerHybrid",
     _name.c_str());
   _raw_plan_publisher->on_deactivate();
+  _footprint_list_publisher->on_deactivate();
   if (_costmap_downsampler) {
     _costmap_downsampler->on_deactivate();
   }
@@ -264,6 +268,7 @@ void SmacPlannerHybrid::cleanup()
     _costmap_downsampler.reset();
   }
   _raw_plan_publisher.reset();
+  _footprint_list_publisher.reset();
 }
 
 nav_msgs::msg::Path SmacPlannerHybrid::createPlan(
@@ -359,9 +364,56 @@ nav_msgs::msg::Path SmacPlannerHybrid::createPlan(
     plan.poses.push_back(pose);
   }
 
+  auto marker_array = std::make_unique<visualization_msgs::msg::MarkerArray>();
+  visualization_msgs::msg::Marker m;
+  m.header.frame_id = _global_frame;
+  m.header.stamp = _clock->now();
+  m.ns = "smach_hybrid_footprint";
+  m.type = visualization_msgs::msg::Marker::LINE_LIST;
+  m.action = visualization_msgs::msg::Marker::ADD;
+  m.scale.x = 0.05;
+  m.scale.y = 0.05;
+  m.scale.z = 0.05;
+  m.color.a = 1.0;
+  m.color.r = 0;
+  m.color.g = 0.0;
+  m.color.b = 1.0;
+  m.lifetime = rclcpp::Duration(0s);
+  m.frame_locked = false;
+
+  unsigned int id = 0;
+  for (size_t i = 0; i < plan.poses.size(); i ++)
+  {
+    const double& x = plan.poses[i].pose.position.x;
+    const double& y = plan.poses[i].pose.position.y;
+    const double& yaw = tf2::getYaw(plan.poses[i].pose.orientation);
+
+    std::vector<geometry_msgs::msg::Point> footprint;
+    transformFootprintToEdges(x, y, yaw, _footprint_spec, footprint);
+
+    m.points.clear();
+    for (auto& point : footprint) {
+      m.points.push_back(point);
+    }
+    m.id = id;
+    id++;
+    marker_array->markers.push_back(m);
+  }
+
+  if (marker_array->markers.empty()) {
+    visualization_msgs::msg::Marker clear_all_marker;
+    clear_all_marker.action = visualization_msgs::msg::Marker::DELETEALL;
+    marker_array->markers.push_back(clear_all_marker);
+  }
+
   // Publish raw path for debug
   if (_raw_plan_publisher->get_subscription_count() > 0) {
     _raw_plan_publisher->publish(plan);
+  }
+
+  // publish footprint for debug
+  if (_footprint_list_publisher->get_subscription_count() > 0) {
+    _footprint_list_publisher->publish(std::move(marker_array));
   }
 
   // Find how much time we have left to do smoothing
@@ -388,6 +440,31 @@ nav_msgs::msg::Path SmacPlannerHybrid::createPlan(
 
   return plan;
 }
+
+
+void SmacPlannerHybrid::transformFootprintToEdges(
+    const double x, const double y, const double yaw,
+    const std::vector<geometry_msgs::msg::Point>& footprint,
+    std::vector<geometry_msgs::msg::Point>& out_footprint)
+{
+  out_footprint.resize(2 * footprint.size());
+  for (unsigned int i = 0; i < footprint.size(); i++)
+  {
+    out_footprint[2 * i].x = x + cos(yaw) * footprint[i].x - sin(yaw) * footprint[i].y;
+    out_footprint[2 * i].y = y + sin(yaw) * footprint[i].x + cos(yaw) * footprint[i].y;
+    if (i == 0)
+    {
+      out_footprint.back().x = out_footprint[i].x;
+      out_footprint.back().y = out_footprint[i].y;
+    }
+    else
+    {
+      out_footprint[2 * i - 1].x = out_footprint[2 * i].x;
+      out_footprint[2 * i - 1].y = out_footprint[2 * i].y;
+    }
+  }
+}
+
 
 rcl_interfaces::msg::SetParametersResult
 SmacPlannerHybrid::dynamicParametersCallback(std::vector<rclcpp::Parameter> parameters)
